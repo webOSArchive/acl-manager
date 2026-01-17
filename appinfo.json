@@ -1,0 +1,10 @@
+{
+	"title": "ACL Manager",
+	"id": "com.starkka.aclmanager",
+	"version": "1.0.0",
+	"vendor": "starkka",
+	"type": "pdk",
+	"main": "acl-manager",
+	"icon": "icon.png",
+	"uiRevision": 2
+}
