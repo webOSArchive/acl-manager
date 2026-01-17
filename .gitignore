@@ -1,0 +1,8 @@
+# Build artifacts
+*.ipk
+acl-manager
+
+# Editor files
+*~
+*.swp
+.*.swp

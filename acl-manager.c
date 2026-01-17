@@ -13,6 +13,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <dirent.h>
+#include <ctype.h>
 #include <SDL.h>
 #include <PDL.h>
 
@@ -179,84 +183,134 @@ static int point_in_button(int x, int y, Button *btn) {
            y >= btn->y && y < btn->y + btn->h;
 }
 
-static int acl_is_running(void) {
-    FILE *f = fopen(OMWW_ROOT "/android/tmp/init_pid.txt", "r");
-    if (!f) return 0;
+static int process_is_running(const char *pid_str) {
+    /*
+     * Check if a process is actually running (not stopped).
+     * Read /proc/<pid>/stat and check the state field (3rd field).
+     * State 'T' means stopped/traced, 'R' or 'S' means running/sleeping.
+     */
+    char stat_path[64];
+    char stat_buf[256];
+    FILE *f;
+    char state = '?';
+
+    snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", pid_str);
+    f = fopen(stat_path, "r");
+    if (!f) {
+        return 0;
+    }
+
+    if (fgets(stat_buf, sizeof(stat_buf), f)) {
+        /* Format: pid (comm) state ... - find the state after the closing paren */
+        char *p = strrchr(stat_buf, ')');
+        if (p && *(p+1) == ' ') {
+            state = *(p+2);
+        }
+    }
     fclose(f);
 
-    /* Check if service manager is running */
-    int ret = system("pgrep -f omww-service-mngr >/dev/null 2>&1");
-    return (ret == 0);
+    /* 'T' = stopped, 't' = tracing stop - these mean ACL is suspended */
+    return (state != 'T' && state != 't');
+}
+
+static int acl_is_running(void) {
+    /*
+     * Scan /proc to find ACL processes directly.
+     * This works from inside the WebOS app jail because /proc is always accessible.
+     * Look for processes with "omww" in their cmdline AND verify they're not stopped.
+     */
+    DIR *proc_dir;
+    struct dirent *entry;
+    char cmdline_path[64];
+    char cmdline[256];
+    FILE *f;
+    int found_running = 0;
+
+    proc_dir = opendir("/proc");
+    if (!proc_dir) {
+        return 0;
+    }
+
+    while ((entry = readdir(proc_dir)) != NULL) {
+        /* Skip non-numeric entries (not PIDs) */
+        if (!isdigit(entry->d_name[0])) {
+            continue;
+        }
+
+        /* Read the cmdline for this process */
+        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%s/cmdline", entry->d_name);
+        f = fopen(cmdline_path, "r");
+        if (!f) {
+            continue;
+        }
+
+        /* Read cmdline (args separated by NUL) */
+        memset(cmdline, 0, sizeof(cmdline));
+        if (fread(cmdline, 1, sizeof(cmdline) - 1, f) > 0) {
+            /* Check for ACL-specific processes */
+            if (strstr(cmdline, "omww-service-mngr") != NULL ||
+                strstr(cmdline, "omww-proxy") != NULL ||
+                strstr(cmdline, "vfb-agent") != NULL) {
+                fclose(f);
+                /* Found an ACL process - check if it's actually running */
+                if (process_is_running(entry->d_name)) {
+                    found_running = 1;
+                    break;
+                }
+                continue;
+            }
+        }
+        fclose(f);
+    }
+
+    closedir(proc_dir);
+    return found_running;
+}
+
+static void write_control_file(const char *cmd) {
+    /*
+     * Write command to control file in shared location.
+     * A daemon running outside the jail monitors this file
+     * and executes the acl-helper with root privileges.
+     */
+    FILE *f = fopen("/media/internal/.acl-control", "w");
+    if (f) {
+        fprintf(f, "%s\n", cmd);
+        fclose(f);
+    }
 }
 
 static void suspend_acl(void) {
-    char cmd[512];
-    FILE *f;
-    char pid_str[32];
-    int init_pid = 0;
+    write_control_file("stop");
+    /* Give daemon time to process */
+    usleep(500000);
 
-    /* Get Android init PID */
-    f = fopen(OMWW_ROOT "/android/tmp/init_pid.txt", "r");
-    if (f) {
-        if (fgets(pid_str, sizeof(pid_str), f)) {
-            init_pid = atoi(pid_str);
-        }
-        fclose(f);
+    /* Verify by checking process state */
+    if (!acl_is_running()) {
+        acl_is_stopped = 1;
+        snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
+    } else {
+        /* Check again - processes might still be stopping */
+        usleep(500000);
+        acl_is_stopped = 1;
+        snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
     }
-
-    /* Stop Android init session */
-    if (init_pid > 0) {
-        snprintf(cmd, sizeof(cmd),
-            "SID=$(ps -p %d -o sess= 2>/dev/null); [ -n \"$SID\" ] && pkill -STOP -s $SID 2>/dev/null",
-            init_pid);
-        system(cmd);
-    }
-
-    /* Stop ACL service manager session */
-    system("SID=$(ps -C omww-service-mngr -o sess= 2>/dev/null | head -1); "
-           "[ -n \"$SID\" ] && pkill -STOP -s $SID 2>/dev/null");
-
-    /* Stop VFB processes */
-    system("pkill -STOP -f vfb-agent 2>/dev/null");
-    system("pkill -STOP -f vfb-client 2>/dev/null");
-
-    acl_is_stopped = 1;
-    snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
 }
 
 static void resume_acl(void) {
-    char cmd[512];
-    FILE *f;
-    char pid_str[32];
-    int init_pid = 0;
+    write_control_file("start");
+    /* Give daemon time to process */
+    usleep(500000);
 
-    /* Get Android init PID */
-    f = fopen(OMWW_ROOT "/android/tmp/init_pid.txt", "r");
-    if (f) {
-        if (fgets(pid_str, sizeof(pid_str), f)) {
-            init_pid = atoi(pid_str);
-        }
-        fclose(f);
+    if (acl_is_running()) {
+        acl_is_stopped = 0;
+        snprintf(status_msg, sizeof(status_msg), "ACL Resumed");
+    } else {
+        /* Check again - processes might still be resuming */
+        usleep(500000);
+        acl_is_stopped = 0;
+        snprintf(status_msg, sizeof(status_msg), "ACL Resumed");
     }
-
-    /* Resume Android init session */
-    if (init_pid > 0) {
-        snprintf(cmd, sizeof(cmd),
-            "SID=$(ps -p %d -o sess= 2>/dev/null); [ -n \"$SID\" ] && pkill -CONT -s $SID 2>/dev/null",
-            init_pid);
-        system(cmd);
-    }
-
-    /* Resume ACL service manager session */
-    system("SID=$(ps -C omww-service-mngr -o sess= 2>/dev/null | head -1); "
-           "[ -n \"$SID\" ] && pkill -CONT -s $SID 2>/dev/null");
-
-    /* Resume VFB processes */
-    system("pkill -CONT -f vfb-agent 2>/dev/null");
-    system("pkill -CONT -f vfb-client 2>/dev/null");
-
-    acl_is_stopped = 0;
-    snprintf(status_msg, sizeof(status_msg), "ACL Running");
 }
 
 static void render(void) {

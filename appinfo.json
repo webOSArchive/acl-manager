@@ -1,8 +1,8 @@
 {
 	"title": "ACL Manager",
-	"id": "com.starkka.aclmanager",
+	"id": "com.palm.acl-manager",
 	"version": "1.0.0",
-	"vendor": "starkka",
+	"vendor": "WebOS Archive",
 	"type": "pdk",
 	"main": "acl-manager",
 	"icon": "icon.png",
