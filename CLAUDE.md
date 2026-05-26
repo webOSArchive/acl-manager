@@ -158,9 +158,34 @@ Simple SDL-based interface:
 
 ## Current Status
 
-**Not yet tested on device** (as of 2026-05-25). All code was written and reviewed
-on a Mac; build and device testing are pending on a Linux machine with a TouchPad.
-Follow the Testing section below in order when picking this up.
+**v1.1.0 — tested and working on device** (as of 2026-05-26).
+
+Stop and start are confirmed working: ACL processes are fully terminated on stop
+and do not restart (verified with a 60-second hold), and `start` correctly
+relaunches ACL via upstart. Three bugs were found and fixed during device testing:
+
+1. **`tr -d '[:space:]'` bug in `acl-watchd.sh`** — TouchPad busybox `tr` treats
+   `[:space:]` as a literal character set, deleting 's' and 'p' from commands.
+   `"stop"` became `"to"`, which the daemon logged as unknown and ignored.
+   Fixed by using `tr -d ' \t\r\n'`.
+
+2. **Wrong process kill strategy in `acl-helper.c`** — The old session-based kill
+   read the session ID from the Android init PID file and `omww-service-mngr`'s
+   stat entry. Unreliable because `webos-services.sh` (the ACL launcher) is a
+   compiled binary that forks services into its own session, which changes on
+   every restart. Replaced with a direct name-based kill: scans `/proc` and
+   SIGKILLs every process whose cmdline matches `omww-`, `vfb-agent`, or
+   `vfb-client`.
+
+3. **Upstart job search matched wrong job** — The search looked for process names
+   (`omww-service-mngr`) inside upstart job files, but those files only reference
+   shell script paths (`webos-services.sh`, `start-acl.sh`). Now searches for
+   `"webos-services"` which uniquely identifies `start-acl-services`.
+
+The app binary (`acl-manager`) has not been installed from the `.ipk` during
+testing — the device binaries were pushed directly via `novacom put`. A fresh
+Preware install from `com.palm.acl-manager_1.1.0_all.ipk` should be done to
+validate the full install path before wider distribution.
 
 ## Development Notes
 
