@@ -95,26 +95,42 @@ ACL (Android Compatibility Layer) runs several processes:
 **The Solution:** A daemon-based architecture:
 1. App writes "stop" or "start" to `/media/internal/.acl-control` (shared with system)
 2. `acl-watchd` daemon (running as root outside jail) reads and removes the file
-3. Daemon calls `acl-helper` which does **both**:
-   - Finds the ACL upstart job (scans `/etc/event.d/` for files mentioning ACL process names)
-     and runs `stop <job>` — marks the job intentionally stopped so upstart won't respawn it
-   - **Always** follows up with SIGSTOP to all ACL sessions (using session IDs from
-     `/proc/<pid>/stat` and `/media/omww/android/tmp/init_pid.txt`) to catch orphaned
-     child processes that upstart didn't kill directly
-   - On "start": runs `start <job>` via upstart; only sends SIGCONT if upstart was unavailable
+3. Daemon calls `acl-helper` which:
+   - Finds the ACL upstart job (scans `/etc/event.d/` for files containing `"webos-services"`
+     or `"start-acl.sh"`) and runs `stop/start <job>` — best-effort, because the jobs are
+     one-shot and may already be in "waiting" state
+   - On "stop": **SIGKILL**s every `omww-*`, `vfb-agent`, `vfb-client` process found in `/proc`
+     by name — this permanently terminates them regardless of session
+   - On "start": relies on upstart `start start-acl-services` to re-launch `webos-services.sh`,
+     which spawns fresh ACL processes; no SIGCONT needed
 
-**Why upstart instead of SIGSTOP:**
-SIGSTOP pauses processes but leaves them "running" from upstart's perspective.
-The Luna service bus monitor (or ACL's internal watchdog) detects that ACL services
-are unresponsive and triggers a restart.  Using `stop <job>` via upstart marks the
-job as intentionally stopped, preventing any respawn.  `start <job>` properly
-re-initialises the service chain.
+**Why SIGKILL by name (not SIGSTOP, not session-based):**
+- SIGSTOP leaves processes alive in /proc; Luna bus monitor sees "unresponsive" services
+  and triggers a restart — exactly the bug we're fixing
+- Session-based kill (the old approach) fails because `webos-services.sh` is a compiled
+  binary launcher that forks ACL processes into its own session; that session ID changes on
+  every restart and is not recorded anywhere predictable
+- SIGKILL by cmdline name reliably finds and terminates all ACL processes regardless of
+  how they were launched or what session they're in; dead processes cannot be revived
+
+**ACL upstart job structure on device (observed):**
+- `start-acl` — one-shot, runs `start-acl.sh` on boot to set up the environment
+- `start-acl-services` — one-shot, runs `webos-services.sh` which spawns all ACL daemons
+  in background and exits; upstart job returns to "waiting" state immediately
+- `start-acl-icon` — copies notification icon after services are up
+- All three are in "waiting" state by the time the user opens ACL Manager
 
 **Detection:** The app scans `/proc` directly (accessible from jail) and checks:
-- `/proc/<pid>/cmdline` for ACL process names
+- `/proc/<pid>/cmdline` for ACL process names (`omww-`, `vfb-agent`)
 - `/proc/<pid>/stat` for process state ('T' = stopped, 'S'/'R' = running)
 - `/media/internal/.acl-stopped` — state file written by acl-helper so "ACL Stopped"
   can be shown even after processes are fully dead (distinguishes from "not installed")
+
+**Known device quirks:**
+- TouchPad busybox `tr` does NOT support POSIX character classes (`[:space:]`).
+  `tr -d '[:space:]'` treats the argument as a literal set of characters, deleting
+  's', 'p', 'a', 'c', 'e', '[', ']', ':' from the input.  Always use explicit
+  whitespace chars: `tr -d ' \t\r\n'`
 
 ### UI Structure
 

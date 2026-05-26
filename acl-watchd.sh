@@ -26,13 +26,16 @@ while true; do
     if [ -f "$CONTROL_FILE" ]; then
         # Read and immediately remove the control file so we don't
         # re-execute it on daemon restart or after a reboot.
-        cmd=$(cat "$CONTROL_FILE" 2>/dev/null | tr -d '[:space:]')
+        # NOTE: Use explicit whitespace chars, NOT [:space:] — the TouchPad's
+        # busybox tr does not support POSIX character classes, and would treat
+        # [:space:] as a literal set of characters, deleting 's', 'p', etc.
+        cmd=$(tr -d ' \t\r\n' < "$CONTROL_FILE" 2>/dev/null)
         rm -f "$CONTROL_FILE"
 
         case "$cmd" in
             stop|start)
                 log "executing: acl-helper $cmd"
-                "$HELPER" "$cmd"
+                "$HELPER" "$cmd" >> "$LOGFILE" 2>&1
                 log "acl-helper $cmd exited $?"
                 ;;
             "")

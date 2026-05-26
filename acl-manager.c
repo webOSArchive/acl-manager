@@ -57,6 +57,9 @@ static SDL_Surface *screen = NULL;
 static char status_msg[256] = "Ready";
 static int acl_is_stopped = 0;
 
+/* Forward declaration */
+static void render(void);
+
 /* Simple font rendering - draws text using basic rectangles */
 static void draw_char(SDL_Surface *surf, int x, int y, char c, Uint32 color, int scale) {
     /* Very basic 5x7 font patterns for A-Z, a-z, 0-9, space, and common punctuation */
@@ -317,8 +320,14 @@ static void suspend_acl(void) {
             break;
     }
 
-    acl_is_stopped = 1;
-    snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
+    if (!acl_is_running()) {
+        acl_is_stopped = 1;
+        snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
+    } else {
+        /* Timed out — daemon may not have run or stop failed */
+        acl_is_stopped = 0;
+        snprintf(status_msg, sizeof(status_msg), "Stop Failed - Retry");
+    }
 }
 
 static void resume_acl(void) {

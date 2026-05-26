@@ -38,14 +38,44 @@
 /* State file in shared storage: tells the app we intentionally stopped ACL */
 #define STATE_FILE "/media/internal/.acl-stopped"
 
-/* PID file written by ACL's Android init layer */
-#define ANDROID_INIT_PID_FILE "/media/omww/android/tmp/init_pid.txt"
+/*
+ * Strings used to identify the ACL upstart job by scanning /etc/event.d/.
+ * The job files themselves reference shell scripts, not process names —
+ * so we search for strings that appear in those script paths.
+ *
+ * On observed devices:
+ *   start-acl-services  exec /media/omww/bin/webos-services.sh
+ *   start-acl           exec /media/omww/bin/start-acl.sh
+ */
+/*
+ * These strings appear in the exec lines of the ACL upstart jobs:
+ *   start-acl-services  →  /media/omww/bin/webos-services.sh
+ *   start-acl           →  /media/omww/bin/start-acl.sh
+ *
+ * We intentionally do NOT use a broad match like "/media/omww" because
+ * other jobs (e.g. start-acl-icon) also reference that path and would
+ * be selected instead of start-acl-services.
+ */
+static const char *ACL_UPSTART_STRINGS[] = {
+    "webos-services",    /* uniquely identifies start-acl-services */
+    "start-acl.sh",      /* identifies start-acl (fallback) */
+    NULL
+};
 
-/* Process names used to identify the ACL upstart job */
+/*
+ * Cmdline prefixes/substrings used to identify running ACL processes in /proc.
+ *
+ * "omww-" catches all omww-service-mngr, omww-proxy, omww-powerd,
+ * omww-sensord, etc.  We use a prefix so we don't have to enumerate
+ * every sub-service — new ones are caught automatically.
+ *
+ * We intentionally avoid matching "/media/omww" because that path appears
+ * in webos-services.sh's argv[0] and we don't want to kill that launcher.
+ */
 static const char *ACL_PROCS[] = {
-    "omww-service-mngr",
-    "omww-proxy",
+    "omww-",       /* all omww-* daemons */
     "vfb-agent",
+    "vfb-client",
     NULL
 };
 
@@ -79,8 +109,8 @@ static int find_acl_job(char *job_name, size_t job_len)
         char line[512];
         int found = 0;
         while (fgets(line, sizeof(line), f)) {
-            for (int i = 0; ACL_PROCS[i]; i++) {
-                if (strstr(line, ACL_PROCS[i])) {
+            for (int i = 0; ACL_UPSTART_STRINGS[i]; i++) {
+                if (strstr(line, ACL_UPSTART_STRINGS[i])) {
                     found = 1;
                     break;
                 }
@@ -137,137 +167,51 @@ static int run_upstart(const char *cmd, const char *job)
 }
 
 /* ------------------------------------------------------------------ */
-/* Signal-based fallback (session kill, like run-pcsx.sh)              */
+/* Process kill by name                                                 */
 /* ------------------------------------------------------------------ */
 
 /*
- * Send sig to every process in the same session as `leader_pid`.
- * Uses pkill -STOP/-CONT -s <sid> if available, otherwise signals
- * individually from /proc.
+ * Send `sig` to every process whose cmdline matches one of ACL_PROCS.
+ *
+ * Session-based killing (pkill -s, kill-by-session) was unreliable:
+ * the ACL launcher (webos-services.sh) is a compiled binary that forks
+ * services into its own session.  That session ID changes on every restart
+ * and is not recorded in any predictable file.  Direct name-based killing
+ * is simpler and works regardless of how ACL was launched.
  */
-static void signal_session(pid_t leader_pid, int sig)
+static void kill_acl_by_name(int sig)
 {
-    /* Try pkill first (handles session kill atomically) */
-    char sid_str[32];
-    snprintf(sid_str, sizeof(sid_str), "%d", (int)leader_pid);
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        char sigarg[32];
-        snprintf(sigarg, sizeof(sigarg), "-%d", sig);
-        execl("/usr/bin/pkill", "pkill", sigarg, "-s", sid_str, NULL);
-        execl("/bin/pkill",     "pkill", sigarg, "-s", sid_str, NULL);
-        _exit(1);
-    }
-    if (pid > 0) {
-        int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-            return; /* pkill succeeded */
-    }
-
-    /* Fallback: iterate /proc and signal matching PIDs */
     DIR *proc = opendir("/proc");
-    if (!proc) return;
+    if (!proc) {
+        perror("acl-helper: opendir /proc");
+        return;
+    }
 
     struct dirent *entry;
     while ((entry = readdir(proc)) != NULL) {
         if (!isdigit(entry->d_name[0])) continue;
 
-        char stat_path[64];
-        snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", entry->d_name);
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
 
-        FILE *f = fopen(stat_path, "r");
+        FILE *f = fopen(path, "r");
         if (!f) continue;
 
-        int pid_val; char comm[256]; char state;
-        int ppid, pgrp, session;
-        int matched = (fscanf(f, "%d %255s %c %d %d %d",
-                              &pid_val, comm, &state,
-                              &ppid, &pgrp, &session) == 6);
+        char cmdline[256] = {0};
+        fread(cmdline, 1, sizeof(cmdline) - 1, f);
         fclose(f);
 
-        if (matched && session == (int)leader_pid)
-            kill((pid_t)pid_val, sig);
-    }
-    closedir(proc);
-}
-
-/*
- * Signal-based stop/start: mimics the approach in run-pcsx.sh.
- * Signals all ACL sessions (Android init session + service manager session).
- */
-static void signal_acl(int sig)
-{
-    /* 1. Android init session (most reliable source of the root PID) */
-    FILE *f = fopen(ANDROID_INIT_PID_FILE, "r");
-    if (f) {
-        pid_t init_pid = 0;
-        fscanf(f, "%d", &init_pid);
-        fclose(f);
-        if (init_pid > 0) {
-            fprintf(stderr, "acl-helper: signaling Android init session %d\n", (int)init_pid);
-            signal_session(init_pid, sig);
+        for (int i = 0; ACL_PROCS[i]; i++) {
+            if (strstr(cmdline, ACL_PROCS[i])) {
+                pid_t target = (pid_t)atoi(entry->d_name);
+                fprintf(stderr, "acl-helper: kill(%d) pid %d [%s]\n",
+                        sig, (int)target, ACL_PROCS[i]);
+                kill(target, sig);
+                break;
+            }
         }
     }
-
-    /* 2. ACL service manager session (may differ from Android init session) */
-    DIR *proc = opendir("/proc");
-    if (!proc) return;
-
-    struct dirent *entry;
-    while ((entry = readdir(proc)) != NULL) {
-        if (!isdigit(entry->d_name[0])) continue;
-
-        char cmdline_path[64];
-        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%s/cmdline", entry->d_name);
-
-        FILE *cf = fopen(cmdline_path, "r");
-        if (!cf) continue;
-
-        char cmdline[256];
-        memset(cmdline, 0, sizeof(cmdline));
-        fread(cmdline, 1, sizeof(cmdline) - 1, cf);
-        fclose(cf);
-
-        if (strstr(cmdline, "omww-service-mngr") == NULL) continue;
-
-        /* Found the service manager — get its session */
-        char stat_path[64];
-        snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", entry->d_name);
-        FILE *sf = fopen(stat_path, "r");
-        if (!sf) continue;
-
-        int pid_val; char comm[256]; char state;
-        int ppid, pgrp, session;
-        if (fscanf(sf, "%d %255s %c %d %d %d",
-                   &pid_val, comm, &state,
-                   &ppid, &pgrp, &session) == 6) {
-            fprintf(stderr, "acl-helper: signaling service manager session %d\n", session);
-            signal_session((pid_t)session, sig);
-        }
-        fclose(sf);
-        break; /* only need the first match */
-    }
     closedir(proc);
-
-    /* 3. vfb-agent / vfb-client might be in their own sessions */
-    DIR *proc2 = opendir("/proc");
-    if (!proc2) return;
-    while ((entry = readdir(proc2)) != NULL) {
-        if (!isdigit(entry->d_name[0])) continue;
-        char cmdline_path[64];
-        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%s/cmdline", entry->d_name);
-        FILE *cf = fopen(cmdline_path, "r");
-        if (!cf) continue;
-        char cmdline[256];
-        memset(cmdline, 0, sizeof(cmdline));
-        fread(cmdline, 1, sizeof(cmdline) - 1, cf);
-        fclose(cf);
-        if (strstr(cmdline, "vfb-agent") || strstr(cmdline, "vfb-client"))
-            kill((pid_t)atoi(entry->d_name), sig);
-    }
-    closedir(proc2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -305,40 +249,47 @@ int main(int argc, char *argv[])
 
     /* --- Try upstart first ----------------------------------------- */
     char job[256] = {0};
-    int upstart_ok = 0;
     if (find_acl_job(job, sizeof(job))) {
         fprintf(stderr, "acl-helper: found ACL upstart job '%s'\n", job);
         int ret = run_upstart(do_stop ? "stop" : "start", job);
         if (ret == 0) {
             fprintf(stderr, "acl-helper: upstart %s %s OK\n", cmd, job);
-            upstart_ok = 1;
         } else {
-            fprintf(stderr, "acl-helper: upstart %s %s failed (exit %d)\n", cmd, job, ret);
+            /*
+             * Expected when job is in "waiting" state (one-shot that already
+             * ran at boot) — not a hard error.  Signal-based kill handles the
+             * actual processes below.
+             */
+            fprintf(stderr, "acl-helper: upstart %s %s returned %d (job may be one-shot)\n",
+                    cmd, job, ret);
         }
     } else {
         fprintf(stderr, "acl-helper: no ACL upstart job found\n");
     }
 
     /*
-     * Always follow up with signals, even after a successful upstart stop.
+     * Signal ACL processes directly.
      *
-     * upstart only kills the main tracked process (omww-service-mngr).
-     * Its children (omww-proxy, vfb-agent, Android init, etc.) are in
-     * separate process groups and become orphans -- they keep running
-     * until explicitly signalled.
+     * On this device the ACL upstart jobs (start-acl, start-acl-services)
+     * are one-shot: they exec a shell script that spawns services in the
+     * background, then exit.  By the time we run, upstart's job is already
+     * in "waiting" state -- so "stop <job>" is a no-op and the running ACL
+     * processes are orphans from upstart's perspective.
      *
-     * For "start": only send SIGCONT if upstart didn't handle it (upstart
-     * start re-launches the service manager which spawns fresh children;
-     * sending SIGCONT to stale PIDs from a previous run is harmless but
-     * noisy, so skip it when upstart succeeded).
+     * For stop: always SIGKILL every ACL process.
+     *   SIGSTOP would leave them as frozen-but-alive in /proc, which the
+     *   Luna service bus monitor interprets as "ACL unresponsive" and
+     *   triggers a restart.  Dead processes (SIGKILL) cannot be revived by
+     *   any watchdog.
+     *
+     * For start: rely on upstart to re-launch ACL ("start start-acl-services").
+     *   SIGCONT is useless for SIGKILL'd processes, so skip it.
      */
     if (do_stop) {
-        fprintf(stderr, "acl-helper: sending SIGSTOP to remaining ACL processes\n");
-        signal_acl(SIGSTOP);
-    } else if (!upstart_ok) {
-        fprintf(stderr, "acl-helper: sending SIGCONT (upstart unavailable)\n");
-        signal_acl(SIGCONT);
+        fprintf(stderr, "acl-helper: killing ACL processes by name\n");
+        kill_acl_by_name(SIGKILL);
     }
+    /* For "start", upstart already handled it above; no signal needed. */
 
     if (do_stop) mark_stopped(); else mark_running();
     return 0;
