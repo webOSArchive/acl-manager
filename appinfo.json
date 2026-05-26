@@ -1,7 +1,7 @@
 {
 	"title": "ACL Manager",
 	"id": "com.palm.acl-manager",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"vendor": "WebOS Archive",
 	"type": "pdk",
 	"main": "acl-manager",
