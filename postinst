@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# postinst - ACL Manager post-install script
+#
+# Copies device components from the app bundle to their system locations
+# and starts the watch daemon.
+#
+# NOTE: This runs as root via Preware/ipkg.  It will NOT work correctly
+# if the package is installed with palm-install (non-root).
+#
+
+set -e
+
+APP_DIR="/media/cryptofs/apps/usr/palm/applications/com.palm.acl-manager"
+
+echo "ACL Manager: installing device components..."
+
+# Install the setuid helper binary.
+# Must live on a non-nosuid filesystem (/usr/bin, not /media/cryptofs).
+cp "$APP_DIR/acl-helper" /usr/bin/acl-helper
+chmod 4755 /usr/bin/acl-helper
+echo "  installed /usr/bin/acl-helper (setuid root)"
+
+# Install the watch daemon script.
+cp "$APP_DIR/acl-watchd.sh" /usr/bin/acl-watchd
+chmod 755 /usr/bin/acl-watchd
+echo "  installed /usr/bin/acl-watchd"
+
+# Install the upstart job.
+cp "$APP_DIR/acl-watchd.conf" /etc/event.d/acl-watchd
+chmod 644 /etc/event.d/acl-watchd
+echo "  installed /etc/event.d/acl-watchd"
+
+# Start the daemon now (it will also auto-start on future boots).
+start acl-watchd 2>/dev/null && echo "  started acl-watchd" || echo "  acl-watchd will start on next boot"
+
+echo "ACL Manager: install complete."
+exit 0

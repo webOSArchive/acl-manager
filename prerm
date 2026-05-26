@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# prerm - ACL Manager pre-remove script
+#
+# Stops the watch daemon and removes all device components before the
+# app bundle is uninstalled.
+#
+
+echo "ACL Manager: removing device components..."
+
+# Stop the daemon (ignore errors if it's already stopped).
+stop acl-watchd 2>/dev/null && echo "  stopped acl-watchd" || true
+
+# Resume ACL if we left it stopped, so the user isn't left in a bad state.
+if [ -f /media/internal/.acl-stopped ]; then
+    echo "  ACL was stopped by this app - resuming before uninstall..."
+    /usr/bin/acl-helper start 2>/dev/null || true
+fi
+
+# Remove system files.
+rm -f /usr/bin/acl-helper
+rm -f /usr/bin/acl-watchd
+rm -f /etc/event.d/acl-watchd
+
+# Remove state/control files.
+rm -f /media/internal/.acl-control
+rm -f /media/internal/.acl-stopped
+
+echo "ACL Manager: removal complete."
+exit 0

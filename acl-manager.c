@@ -25,6 +25,15 @@
 
 #define OMWW_ROOT "/media/omww"
 
+/*
+ * State file written by acl-helper when it stops ACL via upstart.
+ * When ACL is properly stopped (processes killed, not just paused) it
+ * won't show up in /proc at all — same as "not installed."  This file
+ * lets us distinguish the two cases so the UI shows "ACL Stopped"
+ * instead of "ACL Not Detected."
+ */
+#define ACL_STATE_FILE "/media/internal/.acl-stopped"
+
 /* Colors */
 #define COLOR_BG        0x202020
 #define COLOR_BTN_STOP  0xCC4444
@@ -280,36 +289,61 @@ static void write_control_file(const char *cmd) {
     }
 }
 
-static void suspend_acl(void) {
-    write_control_file("stop");
-    /* Give daemon time to process */
-    usleep(500000);
+/*
+ * Returns 1 if acl-helper wrote the state file indicating it stopped ACL.
+ * This lets us show "ACL Stopped" even after the processes are fully dead
+ * (rather than "ACL Not Detected").
+ */
+static int acl_was_stopped_by_us(void) {
+    struct stat st;
+    return stat(ACL_STATE_FILE, &st) == 0;
+}
 
-    /* Verify by checking process state */
-    if (!acl_is_running()) {
-        acl_is_stopped = 1;
-        snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
-    } else {
-        /* Check again - processes might still be stopping */
-        usleep(500000);
-        acl_is_stopped = 1;
-        snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
+static void suspend_acl(void) {
+    snprintf(status_msg, sizeof(status_msg), "Stopping ACL...");
+    render();
+
+    write_control_file("stop");
+
+    /*
+     * Poll until ACL processes disappear or timeout (10 s).
+     * upstart stop sends SIGTERM then SIGKILL, so it can take a few
+     * seconds for all child processes to exit.
+     */
+    int i;
+    for (i = 0; i < 20; i++) {
+        usleep(500000); /* 500 ms */
+        if (!acl_is_running())
+            break;
     }
+
+    acl_is_stopped = 1;
+    snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
 }
 
 static void resume_acl(void) {
-    write_control_file("start");
-    /* Give daemon time to process */
-    usleep(500000);
+    snprintf(status_msg, sizeof(status_msg), "Starting ACL...");
+    render();
 
+    write_control_file("start");
+
+    /*
+     * Poll until ACL processes appear or timeout (15 s).
+     * upstart start spawns the service manager which then launches all
+     * child processes — allow extra time.
+     */
+    int i;
+    for (i = 0; i < 30; i++) {
+        usleep(500000); /* 500 ms */
+        if (acl_is_running())
+            break;
+    }
+
+    acl_is_stopped = 0;
     if (acl_is_running()) {
-        acl_is_stopped = 0;
-        snprintf(status_msg, sizeof(status_msg), "ACL Resumed");
+        snprintf(status_msg, sizeof(status_msg), "ACL Running");
     } else {
-        /* Check again - processes might still be resuming */
-        usleep(500000);
-        acl_is_stopped = 0;
-        snprintf(status_msg, sizeof(status_msg), "ACL Resumed");
+        snprintf(status_msg, sizeof(status_msg), "ACL Start Sent");
     }
 }
 
@@ -364,8 +398,14 @@ int main(int argc, char *argv[]) {
     /* Check initial ACL state */
     if (acl_is_running()) {
         snprintf(status_msg, sizeof(status_msg), "ACL Running");
+        acl_is_stopped = 0;
+    } else if (acl_was_stopped_by_us()) {
+        /* Processes are gone (upstart-killed), but we stopped them on purpose */
+        snprintf(status_msg, sizeof(status_msg), "ACL Stopped");
+        acl_is_stopped = 1;
     } else {
         snprintf(status_msg, sizeof(status_msg), "ACL Not Detected");
+        acl_is_stopped = 0;
     }
 
     /* Main loop */

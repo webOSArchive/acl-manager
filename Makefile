@@ -29,15 +29,24 @@ LDFLAGS = -L$(PDK_PATH)/device/lib \
 	-Wl,--allow-shlib-undefined \
 	-lSDL -lpdl
 
-TARGET = acl-manager
-SRC = acl-manager.c
+# acl-helper needs no SDL/PDL - minimal flags
+HELPER_CFLAGS = -Wall -O2 -std=gnu99 \
+	-march=armv7-a -mfpu=neon -mfloat-abi=softfp
 
-all: $(TARGET)
+TARGET        = acl-manager
+SRC           = acl-manager.c
+HELPER_TARGET = acl-helper
+HELPER_SRC    = acl-helper.c
+
+all: $(TARGET) $(HELPER_TARGET)
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+$(HELPER_TARGET): $(HELPER_SRC)
+	$(CC) $(HELPER_CFLAGS) -o $@ $<
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(HELPER_TARGET)
 
 .PHONY: all clean
